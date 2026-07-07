@@ -49,6 +49,8 @@ Or with the Nordic toolchain CMake directly:
 /opt/nordic/ncs/toolchains/0c0f19d91c/bin/cmake --build build
 ```
 
+or you can just click button on VSCode/nRF Connect extention panel
+
 If your custom board uses a different Zephyr board target, replace `xiao_nrf54l15/nrf54l15/cpuapp` with your board name.
 
 ## Flash
@@ -56,7 +58,7 @@ If your custom board uses a different Zephyr board target, replace `xiao_nrf54l1
 With the board connected through J-Link:
 
 ```sh
-west flash -d build
+west flash
 ```
 
 After flashing, the device advertises as configured in `prj.conf`:
