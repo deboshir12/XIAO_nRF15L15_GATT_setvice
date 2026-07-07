@@ -78,3 +78,6 @@ Use nRF Connect Mobile or another BLE central:
 5. Read or subscribe to the Battery Service characteristics if needed.
 
 The MinewSemi guide also describes a UART demonstration flow with example UART pins `P1.04` for TX and `P1.05` for RX. This project is focused on BLE GATT streaming, so UART is not required for the normal path.
+
+
+Other information about change build target you can see on [NOTION](https://acute-search-25a.notion.site/nRF-build-target-3911968d97e5801da27bc0bae4cc16fe?source=copy_link)
