@@ -70,7 +70,6 @@ void emf_data_generate(uint8_t *dst, size_t len)
 	indenter_speed(speed, EMF_SAMPLE_COUNT);
 
 	for (size_t i = 0; i < EMF_SAMPLE_COUNT; ++i) {
-		int32_t noise = (int32_t)(sys_rand32_get() % 201U) - 100;
 		float value = (speed[i] * 850.0f) + 100.0f;
 
 		// if (value < 0.0f) {

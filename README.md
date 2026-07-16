@@ -79,5 +79,36 @@ Use nRF Connect Mobile or another BLE central:
 
 The MinewSemi guide also describes a UART demonstration flow with example UART pins `P1.04` for TX and `P1.05` for RX. This project is focused on BLE GATT streaming, so UART is not required for the normal path.
 
+## UART EMF Input
+
+The firmware receives EMF sample frames over `uart20` and forwards each complete frame over BLE.
+
+Configured UART pins for the Seeed XIAO nRF54L15 target:
+
+| Signal | nRF54L15 pin | XIAO connector |
+| --- | --- | --- |
+| UART TX | `P1.9` | board default console TX |
+| UART RX | `P1.8` | board default console RX |
+
+UART settings:
+
+```text
+uart20
+115200 baud
+8 data bits
+no parity
+1 stop bit
+RX pull-up enabled
+```
+
+Input frame format:
+
+```text
+8000 samples * 2 bytes = 16000 bytes
+sample format: int16 little-endian
+```
+
+After `16000` bytes are received, UART RX is paused, the payload is sent over BLE in `200` byte chunks through the custom EMF characteristic, and UART RX is enabled again after the full frame has been queued for BLE transmission.
+
 
 Other information about change build target you can see on [NOTION](https://acute-search-25a.notion.site/nRF-build-target-3911968d97e5801da27bc0bae4cc16fe?source=copy_link)

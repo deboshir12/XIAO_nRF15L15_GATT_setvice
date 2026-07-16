@@ -1,6 +1,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/types.h>
 #include <zephyr/sys/printk.h>
+#include <zephyr/drivers/gpio.h>
 
 #include <string.h>
 #include <errno.h>
@@ -11,6 +12,10 @@
 #include <zephyr/bluetooth/uuid.h>
 
 #include "emf_data.h"
+#include "emf_spi.h"
+#include "emf_uart.h"
+
+#define EMF_INPUT_USE_SPI 1
 
 /*
  * BLE services:
@@ -55,9 +60,93 @@ static bool emf_indicate_enabled;
 
 /* EMF data */
 static uint8_t emf_values[EMF_VALUES_SIZE];
-static uint8_t emf_payload[EMF_PAYLOAD_SIZE];
 static size_t emf_payload_offset;
 static bool emf_indication_busy;
+
+/* ------------------------------------------------ */
+/* EMF input source                                 */
+/* ------------------------------------------------ */
+
+#if EMF_INPUT_USE_SPI
+#define emf_input_init() emf_spi_init()
+#define emf_input_frame_ready() emf_spi_frame_ready()
+#define emf_input_take_frame_received_event() emf_spi_take_frame_received_event()
+#define emf_input_payload() emf_spi_payload()
+#define emf_input_release_frame() emf_spi_release_frame()
+#define EMF_INPUT_NAME "SPI"
+#else
+#define emf_input_init() emf_uart_init()
+#define emf_input_frame_ready() emf_uart_frame_ready()
+#define emf_input_take_frame_received_event() emf_uart_take_frame_received_event()
+#define emf_input_payload() emf_uart_payload()
+#define emf_input_release_frame() emf_uart_release_frame()
+#define EMF_INPUT_NAME "UART"
+#endif
+
+/* ------------------------------------------------ */
+/* Status LED                                       */
+/* ------------------------------------------------ */
+
+#define STATUS_LED_NODE DT_ALIAS(led0)
+
+#if DT_NODE_HAS_STATUS(STATUS_LED_NODE, okay)
+static const struct gpio_dt_spec status_led =
+	GPIO_DT_SPEC_GET(STATUS_LED_NODE, gpios);
+
+static struct k_work_delayable status_led_work;
+static int status_led_toggles;
+
+static void status_led_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (status_led_toggles <= 0) {
+		gpio_pin_set_dt(&status_led, 0);
+		return;
+	}
+
+	gpio_pin_toggle_dt(&status_led);
+	status_led_toggles--;
+	k_work_schedule(&status_led_work, K_MSEC(50));
+}
+
+static int status_led_init(void)
+{
+	int err;
+
+	if (!gpio_is_ready_dt(&status_led)) {
+		printk("Status LED is not ready\n");
+		return -ENODEV;
+	}
+
+	err = gpio_pin_configure_dt(&status_led, GPIO_OUTPUT_INACTIVE);
+	if (err) {
+		printk("Status LED config failed: %d\n", err);
+		return err;
+	}
+
+	k_work_init_delayable(&status_led_work, status_led_work_handler);
+
+	return 0;
+}
+
+static void status_led_blink(void)
+{
+	status_led_toggles = 6;
+	gpio_pin_set_dt(&status_led, 0);
+	k_work_schedule(&status_led_work, K_NO_WAIT);
+}
+#else
+static int status_led_init(void)
+{
+	printk("Status LED disabled: led0 alias is not available\n");
+	return 0;
+}
+
+static void status_led_blink(void)
+{
+}
+#endif
 
 /* ------------------------------------------------ */
 /* Read callbacks                                   */
@@ -295,8 +384,13 @@ static int send_next_emf_chunk(void)
 	size_t chunk_size;
 	int err;
 
+	if (!emf_input_frame_ready()) {
+		return -EAGAIN;
+	}
+
 	if (emf_payload_offset >= EMF_PAYLOAD_SIZE) {
-		emf_payload_offset = 0;
+		emf_input_release_frame();
+		return -EAGAIN;
 	}
 
 	chunk_size = EMF_PAYLOAD_SIZE - emf_payload_offset;
@@ -304,7 +398,7 @@ static int send_next_emf_chunk(void)
 		chunk_size = EMF_VALUES_SIZE;
 	}
 
-	err = send_emf_values_indication(&emf_payload[emf_payload_offset],
+	err = send_emf_values_indication(&emf_input_payload()[emf_payload_offset],
 					 chunk_size);
 	if (err) {
 		return err;
@@ -315,6 +409,13 @@ static int send_next_emf_chunk(void)
 	       (unsigned int)chunk_size);
 
 	emf_payload_offset += chunk_size;
+
+	if (emf_payload_offset >= EMF_PAYLOAD_SIZE) {
+		printk("EMF %s frame sent over BLE, size=%u\n",
+		       EMF_INPUT_NAME,
+		       (unsigned int)EMF_PAYLOAD_SIZE);
+		emf_input_release_frame();
+	}
 
 	return 0;
 }
@@ -414,9 +515,10 @@ int main(void)
 
 	printk("Starting BLE GATT server\n");
 
-	emf_data_generate(emf_payload, sizeof(emf_payload));
-	printk("EMF payload generated, size=%u\n",
-	       (unsigned int)sizeof(emf_payload));
+	err = status_led_init();
+	if (err) {
+		printk("Status LED init failed: %d\n", err);
+	}
 
 	err = bt_enable(NULL);
 	if (err) {
@@ -432,8 +534,22 @@ int main(void)
 		return 0;
 	}
 
+	err = emf_input_init();
+	if (err) {
+		printk("EMF %s init failed: %d\n", EMF_INPUT_NAME, err);
+		return 0;
+	}
+
 	while (1) {
 		int64_t now = k_uptime_get();
+
+		if (emf_input_take_frame_received_event()) {
+			emf_payload_offset = 0;
+			status_led_blink();
+			printk("EMF %s frame received, size=%u\n",
+			       EMF_INPUT_NAME,
+			       (unsigned int)EMF_PAYLOAD_SIZE);
+		}
 
 		if ((now - last_battery_update) >= 10000) {
 			if (battery_level > 0) {
@@ -450,17 +566,20 @@ int main(void)
 			last_battery_update = now;
 		}
 
-		if (current_conn && emf_indicate_enabled && !emf_indication_busy) {
+		if (current_conn && emf_indicate_enabled &&
+		    !emf_indication_busy && emf_input_frame_ready()) {
 			err = send_next_emf_chunk();
 
 			if (err == -EMSGSIZE) {
 				printk("EMF chunk too large for current MTU\n");
+			} else if (err == -EAGAIN) {
+				/* Waiting for the next input frame. */
 			} else if (err) {
 				printk("EMF chunk error: %d\n", err);
 			}
 		}
 
-		// k_sleep(K_MSEC(10));
+		k_sleep(K_MSEC(10));
 	}
 
 	return 0;
