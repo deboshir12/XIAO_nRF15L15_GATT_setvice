@@ -28,6 +28,7 @@
  */
 
 #define EMF_VALUES_SIZE 200
+#define EMF_PAYLOAD_DELAY_MS 2000
 
 #define DATA_SERVICE_UUID_VAL \
 	BT_UUID_128_ENCODE(0x00000000, 0x8e22, 0x4541, 0x9d4c, 0x21edae82ed19)
@@ -58,6 +59,7 @@ static uint8_t emf_values[EMF_VALUES_SIZE];
 static uint8_t emf_payload[EMF_PAYLOAD_SIZE];
 static size_t emf_payload_offset;
 static bool emf_indication_busy;
+static int64_t next_emf_message_time;
 
 /* ------------------------------------------------ */
 /* Read callbacks                                   */
@@ -116,6 +118,7 @@ static void emf_ccc_changed(const struct bt_gatt_attr *attr,
 
 	if (emf_indicate_enabled) {
 		emf_payload_offset = 0;
+		next_emf_message_time = 0;
 	}
 
 	printk("EMF indication: %s\n",
@@ -247,6 +250,10 @@ static void emf_indication_complete(struct bt_conn *conn,
 				    uint8_t err)
 {
 	emf_indication_busy = false;
+
+	if (emf_payload_offset >= EMF_PAYLOAD_SIZE) {
+		next_emf_message_time = k_uptime_get() + EMF_PAYLOAD_DELAY_MS;
+	}
 
 	printk("EMF indication complete, err=%u\n", err);
 }
@@ -450,7 +457,8 @@ int main(void)
 			last_battery_update = now;
 		}
 
-		if (current_conn && emf_indicate_enabled && !emf_indication_busy) {
+		if (current_conn && emf_indicate_enabled && !emf_indication_busy &&
+		    now >= next_emf_message_time) {
 			err = send_next_emf_chunk();
 
 			if (err == -EMSGSIZE) {
@@ -460,7 +468,7 @@ int main(void)
 			}
 		}
 
-		// k_sleep(K_MSEC(10));
+		k_sleep(K_MSEC(10));
 	}
 
 	return 0;
