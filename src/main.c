@@ -33,6 +33,7 @@
  */
 
 #define EMF_VALUES_SIZE 200
+#define EMF_INPUT_POLL_INTERVAL_US 100
 
 #define DATA_SERVICE_UUID_VAL \
 	BT_UUID_128_ENCODE(0x00000000, 0x8e22, 0x4541, 0x9d4c, 0x21edae82ed19)
@@ -73,6 +74,7 @@ static bool emf_indication_busy;
 #define emf_input_take_frame_received_event() emf_spi_take_frame_received_event()
 #define emf_input_payload() emf_spi_payload()
 #define emf_input_release_frame() emf_spi_release_frame()
+#define emf_input_poll_debug() emf_spi_poll_debug()
 #define EMF_INPUT_NAME "SPI"
 #else
 #define emf_input_init() emf_uart_init()
@@ -80,6 +82,7 @@ static bool emf_indication_busy;
 #define emf_input_take_frame_received_event() emf_uart_take_frame_received_event()
 #define emf_input_payload() emf_uart_payload()
 #define emf_input_release_frame() emf_uart_release_frame()
+#define emf_input_poll_debug() do { } while (0)
 #define EMF_INPUT_NAME "UART"
 #endif
 
@@ -337,7 +340,9 @@ static void emf_indication_complete(struct bt_conn *conn,
 {
 	emf_indication_busy = false;
 
-	printk("EMF indication complete, err=%u\n", err);
+	if (err) {
+		printk("EMF indication complete failed, err=%u\n", err);
+	}
 }
 
 static struct bt_gatt_indicate_params emf_ind_params;
@@ -403,10 +408,6 @@ static int send_next_emf_chunk(void)
 	if (err) {
 		return err;
 	}
-
-	printk("EMF chunk sent: offset=%u size=%u\n",
-	       (unsigned int)emf_payload_offset,
-	       (unsigned int)chunk_size);
 
 	emf_payload_offset += chunk_size;
 
@@ -543,6 +544,8 @@ int main(void)
 	while (1) {
 		int64_t now = k_uptime_get();
 
+		emf_input_poll_debug();
+
 		if (emf_input_take_frame_received_event()) {
 			emf_payload_offset = 0;
 			status_led_blink();
@@ -579,7 +582,7 @@ int main(void)
 			}
 		}
 
-		k_sleep(K_MSEC(10));
+		k_sleep(K_USEC(EMF_INPUT_POLL_INTERVAL_US));
 	}
 
 	return 0;

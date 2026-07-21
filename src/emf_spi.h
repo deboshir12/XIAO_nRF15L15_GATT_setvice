@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 int emf_spi_init(void);
+void emf_spi_poll_debug(void);
 bool emf_spi_frame_ready(void);
 bool emf_spi_take_frame_received_event(void);
 const uint8_t *emf_spi_payload(void);

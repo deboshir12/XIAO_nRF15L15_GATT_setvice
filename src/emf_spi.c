@@ -3,8 +3,8 @@
 #include <errno.h>
 #include <string.h>
 
+#include <hal/nrf_gpio.h>
 #include <zephyr/device.h>
-#include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/spi.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
@@ -13,27 +13,57 @@
 #include "emf_data.h"
 
 #define EMF_SPI_NODE DT_NODELABEL(spi00)
-#define EMF_SPI_TRIGGER_NODE DT_NODELABEL(emf_spi_trigger)
-#define EMF_SPI_FREQUENCY_HZ 1200000
+#ifndef EMF_SPIS_SCK_PORT
+#define EMF_SPIS_SCK_PORT 2
+#endif
+#ifndef EMF_SPIS_SCK_PIN_NUM
+#define EMF_SPIS_SCK_PIN_NUM 1
+#endif
+#ifndef EMF_SPIS_MOSI_PORT
+#define EMF_SPIS_MOSI_PORT 2
+#endif
+#ifndef EMF_SPIS_MOSI_PIN_NUM
+#define EMF_SPIS_MOSI_PIN_NUM 2
+#endif
+#ifndef EMF_SPIS_CSN_PORT
+#define EMF_SPIS_CSN_PORT 2
+#endif
+#ifndef EMF_SPIS_CSN_PIN_NUM
+#define EMF_SPIS_CSN_PIN_NUM 4
+#endif
+#ifndef EMF_SPIS_BOARD_NAME
+#define EMF_SPIS_BOARD_NAME "board"
+#endif
+
+#define EMF_SPIS_SCK_PIN NRF_GPIO_PIN_MAP(EMF_SPIS_SCK_PORT, EMF_SPIS_SCK_PIN_NUM)
+#define EMF_SPIS_MOSI_PIN NRF_GPIO_PIN_MAP(EMF_SPIS_MOSI_PORT, EMF_SPIS_MOSI_PIN_NUM)
+#define EMF_SPIS_CSN_PIN NRF_GPIO_PIN_MAP(EMF_SPIS_CSN_PORT, EMF_SPIS_CSN_PIN_NUM)
+#define EMF_SPI_RX_THREAD_STACK_SIZE 4096
+#define EMF_SPI_RX_THREAD_PRIORITY 5
 
 static const struct device *const emf_spi = DEVICE_DT_GET(EMF_SPI_NODE);
-static const struct gpio_dt_spec emf_trigger =
-	GPIO_DT_SPEC_GET(EMF_SPI_TRIGGER_NODE, gpios);
 
 static const struct spi_config emf_spi_config = {
-	.frequency = EMF_SPI_FREQUENCY_HZ,
-	.operation = SPI_OP_MODE_MASTER | SPI_WORD_SET(8) |
+	.frequency = 500000,
+	.operation = SPI_OP_MODE_SLAVE | SPI_WORD_SET(8) |
 		     SPI_TRANSFER_MSB | SPI_MODE_CPHA,
 };
 
 static uint8_t payload[EMF_PAYLOAD_SIZE] __aligned(4);
 static volatile bool frame_ready;
 static volatile bool frame_received_event;
-static volatile bool rx_busy;
+static volatile bool rx_armed;
+static volatile int last_rx_error;
+static volatile uint32_t xfer_done_count;
+static volatile uint32_t rx_error_count;
+static bool spi_initialized;
 static uint32_t frame_count;
+static uint8_t last_logged_csn = 0xff;
+static uint32_t last_logged_xfer_done_count;
+static uint32_t last_logged_rx_error_count;
 
-static struct gpio_callback emf_trigger_cb;
-static struct k_work emf_spi_rx_work;
+static K_THREAD_STACK_DEFINE(emf_spi_rx_stack, EMF_SPI_RX_THREAD_STACK_SIZE);
+static struct k_thread emf_spi_rx_thread;
 
 static uint32_t payload_checksum(void)
 {
@@ -46,7 +76,7 @@ static uint32_t payload_checksum(void)
 	return checksum;
 }
 
-static void emf_spi_rx_work_handler(struct k_work *work)
+static void emf_spi_rx_thread_fn(void *p1, void *p2, void *p3)
 {
 	struct spi_buf rx_buf = {
 		.buf = payload,
@@ -58,95 +88,100 @@ static void emf_spi_rx_work_handler(struct k_work *work)
 	};
 	int err;
 
-	ARG_UNUSED(work);
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
 
-	if (rx_busy || frame_ready) {
-		return;
+	while (1) {
+		if (frame_ready) {
+			k_sleep(K_MSEC(1));
+			continue;
+		}
+
+		memset(payload, 0, sizeof(payload));
+		rx_armed = true;
+
+		err = spi_read(emf_spi, &emf_spi_config, &rx_set);
+
+		rx_armed = false;
+		last_rx_error = err;
+
+		if (err) {
+			rx_error_count++;
+			k_sleep(K_MSEC(10));
+			continue;
+		}
+
+		xfer_done_count++;
+		frame_ready = true;
+		frame_received_event = true;
 	}
-
-	rx_busy = true;
-	memset(payload, 0, sizeof(payload));
-
-	err = spi_read(emf_spi, &emf_spi_config, &rx_set);
-	if (err) {
-		printk("EMF SPI master read failed: %d\n", err);
-		rx_busy = false;
-		return;
-	}
-
-	frame_count++;
-	printk("EMF SPI master frame #%u rx: first=%02x %02x %02x %02x %02x %02x %02x %02x checksum=%u\n",
-	       frame_count,
-	       payload[0],
-	       payload[1],
-	       payload[2],
-	       payload[3],
-	       payload[4],
-	       payload[5],
-	       payload[6],
-	       payload[7],
-	       payload_checksum());
-
-	frame_ready = true;
-	frame_received_event = true;
-	rx_busy = false;
-}
-
-static void emf_trigger_handler(const struct device *dev,
-				struct gpio_callback *cb,
-				uint32_t pins)
-{
-	ARG_UNUSED(dev);
-	ARG_UNUSED(cb);
-	ARG_UNUSED(pins);
-
-	k_work_submit(&emf_spi_rx_work);
 }
 
 int emf_spi_init(void)
 {
-	int err;
+	if (spi_initialized) {
+		return 0;
+	}
 
 	if (!device_is_ready(emf_spi)) {
-		printk("EMF SPI is not ready\n");
+		printk("EMF SPIS device is not ready\n");
 		return -ENODEV;
 	}
 
-	if (!gpio_is_ready_dt(&emf_trigger)) {
-		printk("EMF SPI trigger GPIO is not ready\n");
-		return -ENODEV;
-	}
+	spi_initialized = true;
 
-	err = gpio_pin_configure_dt(&emf_trigger, GPIO_INPUT);
-	if (err) {
-		printk("EMF SPI trigger config failed: %d\n", err);
-		return err;
-	}
+	k_thread_create(&emf_spi_rx_thread,
+			emf_spi_rx_stack,
+			K_THREAD_STACK_SIZEOF(emf_spi_rx_stack),
+			emf_spi_rx_thread_fn,
+			NULL,
+			NULL,
+			NULL,
+			K_PRIO_PREEMPT(EMF_SPI_RX_THREAD_PRIORITY),
+			0,
+			K_NO_WAIT);
 
-	k_work_init(&emf_spi_rx_work, emf_spi_rx_work_handler);
-
-	gpio_init_callback(&emf_trigger_cb,
-			   emf_trigger_handler,
-			   BIT(emf_trigger.pin));
-
-	err = gpio_add_callback(emf_trigger.port, &emf_trigger_cb);
-	if (err) {
-		printk("EMF SPI trigger callback failed: %d\n", err);
-		return err;
-	}
-
-	err = gpio_pin_interrupt_configure_dt(&emf_trigger,
-					      GPIO_INT_EDGE_TO_ACTIVE);
-	if (err) {
-		printk("EMF SPI trigger interrupt failed: %d\n", err);
-		return err;
-	}
-
-	printk("EMF SPI master ready: spi00, freq=%u Hz, trigger=P1.6 falling edge, frame=%u bytes\n",
-	       EMF_SPI_FREQUENCY_HZ,
+	printk("EMF SPIS ready: %s spi00 slave, CSN=P%u.%u, SCK=P%u.%u, MOSI=P%u.%u, mode=1, frame=%u bytes\n",
+	       EMF_SPIS_BOARD_NAME,
+	       EMF_SPIS_CSN_PORT,
+	       EMF_SPIS_CSN_PIN_NUM,
+	       EMF_SPIS_SCK_PORT,
+	       EMF_SPIS_SCK_PIN_NUM,
+	       EMF_SPIS_MOSI_PORT,
+	       EMF_SPIS_MOSI_PIN_NUM,
 	       (unsigned int)EMF_PAYLOAD_SIZE);
 
 	return 0;
+}
+
+void emf_spi_poll_debug(void)
+{
+	uint8_t csn = nrf_gpio_pin_read(EMF_SPIS_CSN_PIN);
+	uint8_t sck = nrf_gpio_pin_read(EMF_SPIS_SCK_PIN);
+	uint8_t mosi = nrf_gpio_pin_read(EMF_SPIS_MOSI_PIN);
+
+	if (csn != last_logged_csn ||
+	    xfer_done_count != last_logged_xfer_done_count ||
+	    rx_error_count != last_logged_rx_error_count) {
+		printk("EMF SPIS status: armed=%u ready=%u csn=%u sck=%u mosi=%u done=%u errors=%u err=%d first=%02x %02x %02x %02x\n",
+		       rx_armed ? 1 : 0,
+		       frame_ready ? 1 : 0,
+		       csn,
+		       sck,
+		       mosi,
+		       xfer_done_count,
+		       rx_error_count,
+		       last_rx_error,
+		       payload[0],
+		       payload[1],
+		       payload[2],
+		       payload[3]);
+
+		last_logged_csn = csn;
+		last_logged_xfer_done_count = xfer_done_count;
+		last_logged_rx_error_count = rx_error_count;
+	}
 }
 
 bool emf_spi_frame_ready(void)
@@ -171,4 +206,17 @@ const uint8_t *emf_spi_payload(void)
 void emf_spi_release_frame(void)
 {
 	frame_ready = false;
+
+	frame_count++;
+	printk("EMF SPIS frame #%u rx: first=%02x %02x %02x %02x %02x %02x %02x %02x checksum=%u\n",
+	       frame_count,
+	       payload[0],
+	       payload[1],
+	       payload[2],
+	       payload[3],
+	       payload[4],
+	       payload[5],
+	       payload[6],
+	       payload[7],
+	       payload_checksum());
 }
